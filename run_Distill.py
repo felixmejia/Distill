@@ -31,7 +31,59 @@ from torch.utils.data.dataset import random_split
 import sklearn.metrics as metrics
 from sklearn.metrics import roc_auc_score
 
+
+from transformers import AutoModel, AutoImageProcessor
+
+
+import timm # PyTorch Image Models library
+
+
 use_gpu = torch.cuda.is_available()
+
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+print(f"Using device: {device}")
+
+
+# Definir nueva arquitectura con capa de clasificación
+class RadDinoClassifier(nn.Module):
+    def __init__(self, backbone, num_classes):
+        super(RadDinoClassifier, self).__init__()
+        self.backbone = backbone
+        self.classifier = nn.Linear(self.backbone.config.hidden_size, num_classes)
+
+        # ✅ Definir dispositivo
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)  # ✅ Mueve el modelo al dispositivo seleccionado
+
+    def forward(self, images):
+        # with torch.no_grad():  # Congelar RadDino (solo extraer embeddings)
+            # outputs = self.backbone(**inputs)
+        # Procesar imágenes correctamente
+        # pixel_values = images["pixel_values"]  # ✅ Extrae pixel_values del diccionario
+
+        # Asegurarse de extraer solo imágenes
+        if isinstance(images, dict):
+            pixel_values = images["pixel_values"].to(self.device)  
+        elif isinstance(images, (list, tuple)):
+            # Filtrar solo los tensores que tengan 4 dimensiones (batch_size, channels, height, width)
+            image_tensors = [img for img in images if len(img.shape) == 4]  
+            
+            if not image_tensors:
+                raise ValueError("No se encontraron tensores de imágenes válidos en la entrada.")
+
+            pixel_values = torch.cat(image_tensors, dim=0).to(self.device)  # ✅ Une imágenes sin alterar la estructura
+        else:
+            pixel_values = images.to(self.device)  
+
+
+        # Obtener las características del modelo base
+        outputs = self.backbone(pixel_values=pixel_values)
+
+        cls_embedding = outputs.pooler_output  # Extraer embedding CLS
+        return self.classifier(cls_embedding)  # Pasar por la capa de clasificación
+
+
 
 
 def Train_Model(model, dataLoaderTrain_frt, dataLoaderTrain_lat, dataLoaderVal_frt, dataLoaderVal_lat, class_names, nnClassCount, trMaxEpoch, PATH, config , nameModel ):
@@ -199,7 +251,7 @@ else:
 
 
 
-path = '/home/oem/WORKS/DATA'
+path = '/workspace/WORKS/DATA'
 
 Traindata_frt = pd.read_csv('{0}/CheXpert-v1.0{1}/train_frt.csv'.format(path, img_type)) ###
 Traindata_frt = Traindata_frt.sort_values('Path').reset_index(drop=True)
@@ -297,8 +349,106 @@ else:
 if not os.path.exists(PATH): os.makedirs(PATH)
 
 
-model_Teacher = DenseNet121(nnClassCount, nnIsTrained).cuda()
-model_Teacher = torch.nn.DataParallel(model_Teacher).cuda()
+########################  MODEL TEACHER  ##############################################
+
+# model_Teacher = DenseNet121(nnClassCount, nnIsTrained).cuda()
+# model_Teacher = torch.nn.DataParallel(model_Teacher).cuda()
+
+
+########################  MODEL TEACHER  ##############################################
+
+
+# Cargar modelo RAD-DINO preentrenado
+
+# model = AutoModel.from_pretrained("MIT/raddino")  # Verifica el nombre exacto
+
+modelo_base = AutoModel.from_pretrained('microsoft/rad-dino')
+procesador = AutoImageProcessor.from_pretrained('microsoft/rad-dino')
+model_Teacher = RadDinoClassifier(modelo_base, nnClassCount).to('cuda')
+
+
+# 1. replace output layer with chexpert number of classes (pretrained loads ImageNet n_classes)
+model_Teacher.classifier = nn.Linear(model_Teacher.classifier.in_features, out_features=nnClassCount).to(device)
+# 2. init output layer with default torchvision init
+nn.init.constant_(model_Teacher.classifier.bias, 0)
+# 3. store locations of forward and backward hooks for grad-cam
+grad_cam_hooks = {'forward': model_Teacher.backbone.embeddings, 'backward': model_Teacher.classifier}
+# 4. init optimizer and scheduler
+optimizer = torch.optim.Adam(model_Teacher.parameters(), lr=cfg.lr)
+scheduler = None
+#   
+
+# Model settings
+# DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# print(f"Using device: {DEVICE}")
+# IMG_SIZE = 224
+# MODEL_NAME = 'vit_base_patch16_224_dino' # Using standard DINO ViT from timm
+# # If you have custom Rad-DINO weights:
+# # RAD_DINO_CHECKPOINT_PATH = '/path/to/your/rad_dino_checkpoint.pth' # !!! UNCOMMENT AND UPDATE IF NEEDED !!!
+# NUM_CLASSES = 5 # 14 
+
+
+# # --- Model Definition ---
+# print(f"Loading model: {MODEL_NAME}")
+# model_Teacher = timm.create_model(MODEL_NAME, pretrained=True)
+
+# # --- !!! Potential Rad-DINO Loading Section !!! ---
+# # If you have a specific Rad-DINO checkpoint:
+# # 1. You might need the original model definition code if it's not standard ViT.
+# # 2. Load the state dict:
+# try:
+#     checkpoint = torch.load('chexpert_rad_dino_best.pth', map_location='cpu')
+#     # Adjust the key names if necessary (e.g., remove 'module.' prefix if saved with DataParallel)
+#     state_dict = checkpoint['state_dict'] # Or checkpoint['model'] or just checkpoint, depending on how it was saved
+#     # Filter out incompatible keys (like the final classifier head)
+#     model_dict = model.state_dict()
+#     pretrained_dict = {k: v for k, v in state_dict.items() if k in model_dict and model_dict[k].shape == v.shape}
+#     model_dict.update(pretrained_dict)
+#     missing_keys, unexpected_keys = model.load_state_dict(model_dict, strict=False)
+#     print(f"Loaded custom weights. Missing: {len(missing_keys)}, Unexpected: {len(unexpected_keys)}")
+#     # Freeze backbone layers if desired (common in fine-tuning)
+#     # for name, param in model.named_parameters():
+#     #     if not name.startswith('head'): # Freeze all except the head
+#     #         param.requires_grad = False
+# except Exception as e:
+#      print(f"Could not load custom Rad-DINO weights from {'chexpert_rad_dino_best.pth'}: {e}")
+#      print("Proceeding with standard DINO weights.")
+# # --- End Rad-DINO Loading Section ---
+
+# if hasattr(model_Teacher, 'embed_dim'):
+#     num_ftrs = model_Teacher.embed_dim
+#     print(f"Usando model.embed_dim: {num_ftrs}")
+# elif hasattr(model_Teacher, 'num_features') and model_Teacher.num_features > 0: # A veces num_features es lo mismo que embed_dim en ViT
+#     num_ftrs = model_Teacher.num_features
+#     print(f"Usando model.num_features: {num_ftrs}")
+# # ... (Otras opciones si estas fallan) ...
+# else:
+#      # Opción más genérica: mirar la capa de normalización antes de la cabeza (si existe)
+#      if hasattr(model_Teacher, 'norm') and isinstance(model_Teacher.norm, torch.nn.LayerNorm):
+#          num_ftrs = model_Teacher.norm.normalized_shape[0]
+#          print(f"Usando model.norm.normalized_shape[0]: {num_ftrs}")
+#      else:
+#          # Si todo falla, inspecciona manualmente con print(model) o usa un valor conocido
+#          print("No se pudo determinar num_ftrs automáticamente. Inspecciona 'print(model)'.")
+#          # Para ViT-Base, el valor estándar suele ser 768. ¡Úsalo con precaución!
+#          # num_ftrs = 768
+#          # print(f"Usando valor predeterminado (¡PRECAUCIÓN!): {num_ftrs}")
+#          raise AttributeError("No se pudo determinar num_ftrs. Inspecciona la estructura del modelo.")
+
+# Ahora puedes definir tu nueva cabeza de clasificación
+# num_classes = TU_NUMERO_DE_CLASES # Define cuántas clases tienes en CheXpert
+# model.head = torch.nn.Linear(num_ftrs, num_classes)
+
+# model_Teacher.head = nn.Linear(num_ftrs, NUM_CLASSES) # Replace head with a new one for our task
+# model = model_Teacher.to(DEVICE)
+
+# --- Loss Function and Optimizer ---
+# Use BCEWithLogitsLoss for multi-label classification (combines Sigmoid + BCE)
+# criterion = nn.BCEWithLogitsLoss()
+# optimizer = optim.AdamW(model.parameters(), lr=cfg.lr)
+
+
+########################  MODEL TEACHER  ##############################################
 
 
 model_Teacher, model_Teacher_num_frt, model_Teacher_num_frt_each, model_Teacher_num_lat_each, train_Teacher_valid_start_frt, train_Teacher_valid_end_frt, train_Teacher_time_frt, train_Teacher_valid_start_lat, train_Teacher_valid_end_lat, train_Teacher_time_lat = Train_Model(model_Teacher, dataLoaderTrain_frt, dataLoaderTrain_lat, dataLoaderVal_frt, dataLoaderVal_lat, class_names, nnClassCount, trMaxEpoch, PATH, cfg, "Teacher")
